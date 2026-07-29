@@ -1,0 +1,12 @@
+# MuDa Dependencies
+# Core audio downloading library
+yt-dlp>=2024.3.10
+
+# CLI formatting, colors, tables, and progress bars
+rich>=13.7.0
+
+# HTTP requests for Spotify metadata scraping
+requests>=2.31.0
+
+# HTML parsing for Spotify web embed scraping
+beautifulsoup4>=4.12.0

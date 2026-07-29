@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environment folders
+.venv/
+venv/
+ENV/
+env/
+
+# Downloaded music/audio output folder
+downloads/
+*.mp3
+*.m4a
+*.webm
+*.opus
+*.wav
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
