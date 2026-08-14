@@ -55,6 +55,10 @@ MuDa/
   ```bash
   sudo apt update && sudo apt install ffmpeg -y
   ```
+- **Android** (Termux):
+  ```bash
+  pkg update && pkg install ffmpeg python git -y
+  ```
 
 ### 2. Clone / Download & Install Dependencies
 
@@ -74,6 +78,52 @@ source venv/bin/activate
 # Install required Python packages
 pip install -r requirements.txt
 ```
+
+---
+
+## 📱 Termux (Android) Setup & Usage Guide
+
+You can easily set up and run **MuDa** directly on your Android device using [Termux](https://termux.dev/).
+
+> [!TIP]
+> It is recommended to install Termux via **F-Droid** or GitHub Releases instead of the outdated Google Play Store version.
+
+### Step 1: Grant Storage Access
+Allow Termux to access phone storage so downloaded MP3s save directly to your Android device storage:
+```bash
+termux-setup-storage
+```
+
+### Step 2: Update Packages & Install System Tools
+```bash
+pkg update && pkg upgrade -y
+pkg install python ffmpeg git -y
+```
+
+### Step 3: Clone Repository & Install Python Packages
+```bash
+git clone https://github.com/YOUR_USERNAME/MuDa.git
+cd MuDa
+pip install -r requirements.txt
+```
+
+### Step 4: Run MuDa on Termux
+
+- **Interactive Mode**:
+  ```bash
+  python main.py
+  ```
+
+- **Save directly to Phone's Music folder (`/sdcard/Music`)**:
+  ```bash
+  python main.py "https://open.spotify.com/playlist/..." -o ~/storage/music
+  ```
+
+- **Save directly to Phone's Downloads folder (`/sdcard/Download`)**:
+  ```bash
+  python main.py "https://www.youtube.com/watch?v=..." -o ~/storage/downloads
+  ```
+
 
 ---
 
@@ -101,66 +151,8 @@ python main.py "https://open.spotify.com/album/1A2HoYik7p2Exb25LWenY3"
 
 ---
 
-## 🐙 Step-by-Step GitHub Upload Instructions
-
-Follow these exact terminal commands to push your project up to a new GitHub repository:
-
-### Step 1: Initialize Git Local Repository
-Navigate to your project root folder and run:
-```bash
-git init
-```
-
-### Step 2: Configure Git User (If not already set)
-```bash
-git config --global user.name "Your Name"
-git config --global user.email "your.email@example.com"
-```
-
-### Step 3: Check Status & Stage Files
-Verify `.gitignore` is present so `downloads/` and `venv/` are excluded:
-```bash
-git status
-```
-Stage all project files:
-```bash
-git add .
-```
-
-### Step 4: Create Initial Commit
-```bash
-git commit -m "feat: initial commit for MuDa audio downloader tool"
-```
-
-### Step 5: Rename Default Branch to `main`
-```bash
-git branch -M main
-```
-
-### Step 6: Create Remote Repository & Push to GitHub
-
-#### Option A: Using GitHub CLI (`gh`) - Recommended
-```bash
-# Login to GitHub CLI (if needed)
-gh auth login
-
-# Create public repository on GitHub and push code immediately
-gh repo create MuDa --public --source=. --remote=origin --push
-```
-
-#### Option B: Via GitHub Website (Manual)
-1. Go to [https://github.com/new](https://github.com/new).
-2. Name your repository **`MuDa`**.
-3. Leave "Initialize this repository with a README" **unchecked** (since we already created one).
-4. Click **Create repository**.
-5. Copy the repository URL (e.g. `https://github.com/username/MuDa.git`) and run in your terminal:
-```bash
-git remote add origin https://github.com/YOUR_USERNAME/MuDa.git
-git push -u origin main
-```
-
----
 
 ## 📜 License
 
 Distributed under the MIT License. See `LICENSE` for details.
+
