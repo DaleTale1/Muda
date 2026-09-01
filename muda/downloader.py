@@ -20,6 +20,20 @@ from muda.spotify import SpotifyTrack, SpotifyParser
 from muda.utils import sanitize_filename
 
 
+FALLBACK_CLIENT_PROFILES: List[List[str]] = [
+    # Profile 1: Multi-client standard fallback
+    ["android_vr", "web_embedded", "mweb", "ios", "tv_embedded"],
+    # Profile 2: iOS client (bypasses Android Play Integrity & Web BotGuard challenges)
+    ["ios", "mweb"],
+    # Profile 3: Smart TV Embedded client (permissive streaming protocol)
+    ["tv_embedded", "tv"],
+    # Profile 4: Creator clients
+    ["android_creator", "web_creator"],
+    # Profile 5: Lightweight mobile web
+    ["mweb"],
+]
+
+
 class DownloadResult:
     """
     Data model representing the outcome of a track download operation.
@@ -43,12 +57,15 @@ class DownloadResult:
 class AudioDownloader:
     """
     Wraps yt-dlp Python API to manage audio downloads and conversions.
+    Includes automated fallback client retry mechanisms against HTTP 403 / BotGuard blocks.
 
     Args:
         output_dir (str): Folder path where MP3 files will be saved.
         audio_quality (str): Bitrate for MP3 conversion (e.g., "320", "256", "192").
         delay (float): Delay in seconds between track requests to avoid YouTube rate limiting.
         progress_callback (Optional[Callable]): Callback function receiving progress dicts.
+        use_oauth (bool): Whether to authenticate via YouTube OAuth device login.
+        cookies (Optional[str]): Path to a cookies.txt file for session authentication.
     """
 
     def __init__(
@@ -57,30 +74,46 @@ class AudioDownloader:
         audio_quality: str = "320",
         delay: float = 1.5,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        use_oauth: bool = False,
+        cookies: Optional[str] = None,
     ):
         self.output_dir = Path(output_dir).resolve()
         self.audio_quality = str(audio_quality)
         self.delay = float(delay)
         self.progress_callback = progress_callback
+        self.use_oauth = use_oauth
+        self.cookies = cookies
 
         # Ensure output folder exists on disk
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_yt_dlp_options(self, custom_filename: Optional[str] = None) -> Dict[str, Any]:
+    @staticmethod
+    def _is_403_or_bot_block(err: Exception) -> bool:
+        """
+        Determines whether a raised exception is an HTTP 403 Forbidden,
+        Play Integrity challenge, or bot detection block.
+        """
+        err_msg = str(err).lower()
+        keywords = [
+            "403",
+            "forbidden",
+            "sign in to confirm",
+            "bot",
+            "confirm you",
+            "sabr",
+            "unable to download video data",
+            "http error 403",
+        ]
+        return any(kw in err_msg for kw in keywords)
+
+    def _get_yt_dlp_options(
+        self,
+        custom_filename: Optional[str] = None,
+        client_profile: Optional[List[str]] = None,
+        force_oauth: bool = False,
+    ) -> Dict[str, Any]:
         """
         Constructs the configuration dictionary passed to `yt_dlp.YoutubeDL()`.
-
-        Options explained:
-        - `format`: Selects the best available audio stream.
-        - `postprocessors`: Invokes FFmpeg to extract audio and encode it to MP3.
-        - `outtmpl`: File output path template.
-        - `quiet` / `no_warnings`: Suppresses verbose stdout so Rich CLI stays clean.
-        - `progress_hooks`: List of functions called by yt-dlp during download progress.
-        - `sleep_interval` / `max_sleep_interval`: Adds random delay between requests to bypass YouTube rate limits.
-        - `retries`: Retries failed HTTP requests automatically.
-
-        Returns:
-            Dict[str, Any]: Dictionary of yt-dlp options.
         """
         # Determine output filename template
         if custom_filename:
@@ -89,7 +122,9 @@ class AudioDownloader:
         else:
             out_template = str(self.output_dir / "%(title)s.%(ext)s")
 
-        ydl_opts = {
+        active_clients = client_profile or FALLBACK_CLIENT_PROFILES[0]
+
+        ydl_opts: Dict[str, Any] = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
             "postprocessors": [
@@ -114,11 +149,9 @@ class AudioDownloader:
             "sleep_interval": int(self.delay),
             "max_sleep_interval": int(self.delay + 2.0),
             "sleep_interval_requests": 1,
-            # Fix YouTube HTTP 403 & Error 152 by using fallback player clients
-            # Combining android_vr, web_embedded, mweb, and tv_embedded avoids SABR rate limits.
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android_vr", "web_embedded", "mweb", "ios", "tv_embedded"],
+                    "player_client": active_clients,
                 }
             },
             "http_headers": {
@@ -131,6 +164,13 @@ class AudioDownloader:
                 "Accept-Language": "en-us,en;q=0.5",
             },
         }
+
+        if self.use_oauth or force_oauth:
+            ydl_opts["username"] = "oauth"
+            ydl_opts["password"] = ""
+
+        if self.cookies:
+            ydl_opts["cookiefile"] = self.cookies
 
         # Attach custom progress callback if provided
         if self.progress_callback:
@@ -183,7 +223,8 @@ class AudioDownloader:
 
     def download_spotify_track(self, track: SpotifyTrack) -> DownloadResult:
         """
-        Searches YouTube for a single SpotifyTrack using `ytsearch1:` and downloads the best audio match.
+        Searches YouTube for a single SpotifyTrack using `ytsearch1:` and downloads the best audio match,
+        with automatic fallback retries across client profiles if HTTP 403 occurs.
 
         Args:
             track (SpotifyTrack): Parsed Spotify track info.
@@ -204,34 +245,47 @@ class AudioDownloader:
                 error_message="File already exists in download folder.",
             )
 
-        ydl_opts = self._get_yt_dlp_options(custom_filename=f"{track.artist} - {track.title}")
+        last_error = ""
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(query, download=True)
-                
-                if not info_dict or "entries" not in info_dict or not info_dict["entries"]:
+        # Try download with primary and fallback client profiles if 403 occurs
+        for idx, client_profile in enumerate(FALLBACK_CLIENT_PROFILES):
+            ydl_opts = self._get_yt_dlp_options(
+                custom_filename=f"{track.artist} - {track.title}",
+                client_profile=client_profile,
+            )
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info_dict = ydl.extract_info(query, download=True)
+                    
+                    if not info_dict or "entries" not in info_dict or not info_dict["entries"]:
+                        return DownloadResult(
+                            title=f"{track.artist} - {track.title}",
+                            status="failed",
+                            error_message="No YouTube search result found for track query.",
+                        )
+
                     return DownloadResult(
                         title=f"{track.artist} - {track.title}",
-                        status="failed",
-                        error_message="No YouTube search result found for track query.",
+                        status="success",
+                        filepath=str(expected_filepath),
                     )
+            except Exception as err:
+                last_error = str(err)
+                if self._is_403_or_bot_block(err) and idx < len(FALLBACK_CLIENT_PROFILES) - 1:
+                    continue
+                break
 
-                return DownloadResult(
-                    title=f"{track.artist} - {track.title}",
-                    status="success",
-                    filepath=str(expected_filepath),
-                )
-        except Exception as err:
-            return DownloadResult(
-                title=f"{track.artist} - {track.title}",
-                status="failed",
-                error_message=str(err),
-            )
+        return DownloadResult(
+            title=f"{track.artist} - {track.title}",
+            status="failed",
+            error_message=last_error,
+        )
 
     def download_youtube_url(self, yt_url: str) -> List[DownloadResult]:
         """
-        Downloads audio directly from a YouTube video URL or playlist URL.
+        Downloads audio directly from a YouTube video URL or playlist URL,
+        automatically rotating fallback client profiles upon 403 Forbidden errors.
 
         Args:
             yt_url (str): YouTube video link or playlist link.
@@ -239,52 +293,61 @@ class AudioDownloader:
         Returns:
             List[DownloadResult]: Results of all video items.
         """
-        results: List[DownloadResult] = []
-        ydl_opts = self._get_yt_dlp_options()
+        last_error = ""
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract metadata first to inspect whether it's a playlist or single video
-                info_dict = ydl.extract_info(yt_url, download=False)
-                
-                if not info_dict:
-                    return [DownloadResult(title=yt_url, status="failed", error_message="Could not extract video metadata.")]
+        for idx, client_profile in enumerate(FALLBACK_CLIENT_PROFILES):
+            results: List[DownloadResult] = []
+            ydl_opts = self._get_yt_dlp_options(client_profile=client_profile)
 
-                # Check if payload is a playlist (contains 'entries' key)
-                if "entries" in info_dict and info_dict["entries"]:
-                    entries = [e for e in info_dict["entries"] if e is not None]
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Extract metadata first to inspect whether it's a playlist or single video
+                    info_dict = ydl.extract_info(yt_url, download=False)
                     
-                    # Now download full playlist
-                    ydl.download([yt_url])
+                    if not info_dict:
+                        return [DownloadResult(title=yt_url, status="failed", error_message="Could not extract video metadata.")]
 
-                    for entry in entries:
-                        title = entry.get("title", "Unknown Title")
-                        safe_title = sanitize_filename(title)
-                        expected_path = str(self.output_dir / f"{safe_title}.mp3")
+                    # Check if payload is a playlist (contains 'entries' key)
+                    if "entries" in info_dict and info_dict["entries"]:
+                        entries = [e for e in info_dict["entries"] if e is not None]
                         
+                        # Now download full playlist
+                        ydl.download([yt_url])
+
+                        for entry in entries:
+                            title = entry.get("title", "Unknown Title")
+                            raw_path = ydl.prepare_filename(entry)
+                            expected_path = str(Path(raw_path).with_suffix(".mp3"))
+                            exists = os.path.exists(expected_path)
+                            
+                            results.append(
+                                DownloadResult(
+                                    title=title,
+                                    status="success" if exists else "skipped",
+                                    filepath=expected_path if exists else "",
+                                )
+                            )
+                    else:
+                        # Single video download
+                        title = info_dict.get("title", "YouTube Audio")
+                        ydl.download([yt_url])
+                        
+                        raw_path = ydl.prepare_filename(info_dict)
+                        expected_path = str(Path(raw_path).with_suffix(".mp3"))
+                        exists = os.path.exists(expected_path)
+
                         results.append(
                             DownloadResult(
                                 title=title,
-                                status="success" if os.path.exists(expected_path) else "skipped",
-                                filepath=expected_path if os.path.exists(expected_path) else "",
+                                status="success" if exists else "skipped",
+                                filepath=expected_path if exists else "",
                             )
                         )
-                else:
-                    # Single video download
-                    title = info_dict.get("title", "YouTube Audio")
-                    ydl.download([yt_url])
-                    
-                    safe_title = sanitize_filename(title)
-                    expected_path = str(self.output_dir / f"{safe_title}.mp3")
+                    return results
+            except Exception as err:
+                last_error = str(err)
+                if self._is_403_or_bot_block(err) and idx < len(FALLBACK_CLIENT_PROFILES) - 1:
+                    continue
+                return [DownloadResult(title=yt_url, status="failed", error_message=last_error)]
 
-                    results.append(
-                        DownloadResult(
-                            title=title,
-                            status="success" if os.path.exists(expected_path) else "skipped",
-                            filepath=expected_path if os.path.exists(expected_path) else "",
-                        )
-                    )
-        except Exception as err:
-            results.append(DownloadResult(title=yt_url, status="failed", error_message=str(err)))
-
-        return results
+        return [DownloadResult(title=yt_url, status="failed", error_message=last_error)]

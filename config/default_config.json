@@ -3,5 +3,7 @@
   "audio_format": "mp3",
   "audio_quality": "320",
   "max_concurrent_downloads": 3,
+  "use_oauth": false,
+  "cookies": null,
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }

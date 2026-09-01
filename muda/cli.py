@@ -149,6 +149,17 @@ def run_cli() -> None:
         choices=["128", "192", "256", "320"],
         help="Audio quality bitrate in kbps",
     )
+    parser.add_argument(
+        "--oauth",
+        action="store_true",
+        default=config.get("use_oauth", False),
+        help="Authenticate via YouTube OAuth (device login) to bypass strict bot/Android restrictions",
+    )
+    parser.add_argument(
+        "--cookies",
+        default=config.get("cookies", None),
+        help="Path to cookies.txt file for YouTube authentication",
+    )
 
     args = parser.parse_args()
 
@@ -216,11 +227,13 @@ def run_cli() -> None:
             elif d.get("status") == "finished":
                 progress.update(current_task, description="[green]Extracting audio (FFmpeg)...")
 
-        # Initialize Downloader Engine
+        # Initialize Downloader Engine with automatic fallback and optional OAuth / cookies
         downloader = AudioDownloader(
             output_dir=args.output,
             audio_quality=args.quality,
             progress_callback=progress_hook,
+            use_oauth=args.oauth,
+            cookies=args.cookies,
         )
 
         try:
