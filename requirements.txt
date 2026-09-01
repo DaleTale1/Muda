@@ -10,3 +10,7 @@ requests>=2.31.0
 
 # HTML parsing for Spotify web embed scraping
 beautifulsoup4>=4.12.0
+
+# Optional but recommended: faster HTML parser used by BeautifulSoup
+# Falls back to built-in html.parser if not installed
+lxml>=4.9.0

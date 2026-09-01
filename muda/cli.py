@@ -160,6 +160,14 @@ def run_cli() -> None:
         default=config.get("cookies", None),
         help="Path to cookies.txt file for YouTube authentication",
     )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=config.get("max_concurrent_downloads", 4),
+        metavar="N",
+        help="Number of parallel download threads for Spotify playlists (default: 4)",
+    )
 
     args = parser.parse_args()
 
@@ -234,6 +242,7 @@ def run_cli() -> None:
             progress_callback=progress_hook,
             use_oauth=args.oauth,
             cookies=args.cookies,
+            max_workers=args.workers,
         )
 
         try:

@@ -7,11 +7,18 @@ Spotify does not serve raw MP3 files directly, but it provides rich metadata
 (Track Name, Artist, Album, Duration). This module parses Spotify URLs (Track,
 Playlist, or Album), extracts track metadata without requiring developer API keys,
 and converts each entry into a YouTube search query (e.g., "Artist Name - Track Title").
+
+Performance improvements:
+- `requests.Session` is reused across all HTTP calls to avoid repeated TCP handshakes.
+- Parallel oEmbed sub-requests in the collection fallback path via ThreadPoolExecutor.
+- lxml parser used for BeautifulSoup when available (faster than html.parser).
 """
 
 import json
 import re
-from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -20,16 +27,30 @@ DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
+        "Chrome/125.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# Pick the fastest available HTML parser for BeautifulSoup
+try:
+    import lxml  # noqa: F401
+    _HTML_PARSER = "lxml"
+except ImportError:
+    _HTML_PARSER = "html.parser"
+
+
+def _make_session() -> requests.Session:
+    """Creates a requests.Session pre-loaded with default headers."""
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    return session
 
 
 class SpotifyTrack:
     """
     Data structure representing a single parsed Spotify track.
-    
+
     Attributes:
         title (str): Track title (e.g., "Blinding Lights")
         artist (str): Artist name (e.g., "The Weeknd")
@@ -60,6 +81,7 @@ class SpotifyTrack:
 class SpotifyParser:
     """
     Handles URL identification and metadata extraction from Spotify links.
+    Uses a shared requests.Session for connection reuse across all HTTP calls.
     """
 
     @staticmethod
@@ -108,19 +130,21 @@ class SpotifyParser:
             ValueError: If the link format is invalid or metadata cannot be retrieved.
         """
         url_type = cls.get_url_type(url)
-        
+
         if not url_type:
             raise ValueError(f"Invalid or unsupported Spotify link: {url}")
 
+        session = _make_session()
+
         if url_type == "track":
-            return [cls._parse_track(url)]
+            return [cls._parse_track(url, session)]
         elif url_type in ("playlist", "album"):
-            return cls._parse_collection(url, url_type)
+            return cls._parse_collection(url, url_type, session)
         else:
             raise ValueError(f"Unsupported Spotify URL type: {url_type}")
 
     @classmethod
-    def _parse_track(cls, url: str) -> SpotifyTrack:
+    def _parse_track(cls, url: str, session: Optional[requests.Session] = None) -> SpotifyTrack:
         """
         Parses a single Spotify track using Spotify's public oEmbed API.
         Endpoint: https://open.spotify.com/oembed?url=...
@@ -132,9 +156,10 @@ class SpotifyParser:
           ...
         }
         """
+        s = session or _make_session()
         try:
             oembed_url = f"https://open.spotify.com/oembed?url={url}"
-            response = requests.get(oembed_url, headers=DEFAULT_HEADERS, timeout=10)
+            response = s.get(oembed_url, timeout=10)
             response.raise_for_status()
             data = response.json()
 
@@ -142,20 +167,21 @@ class SpotifyParser:
             artist = data.get("author_name", "Unknown Artist")
 
             return SpotifyTrack(title=title, artist=artist, spotify_url=url)
-        except Exception as err:
+        except Exception:
             # Fallback to HTML meta tag scraping if oEmbed API fails
-            return cls._parse_track_fallback(url)
+            return cls._parse_track_fallback(url, s)
 
     @classmethod
-    def _parse_track_fallback(cls, url: str) -> SpotifyTrack:
+    def _parse_track_fallback(cls, url: str, session: Optional[requests.Session] = None) -> SpotifyTrack:
         """
         Fallback scraper for single tracks using HTML OpenGraph meta tags.
         """
-        response = requests.get(url, headers=DEFAULT_HEADERS, timeout=10)
+        s = session or _make_session()
+        response = s.get(url, timeout=10)
         response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        
+
+        soup = BeautifulSoup(response.text, _HTML_PARSER)
+
         # Extract title from og:title meta tag
         title_meta = soup.find("meta", property="og:title")
         title = title_meta["content"] if title_meta else "Unknown Track"
@@ -163,7 +189,7 @@ class SpotifyParser:
         # Extract artist from description or page title
         desc_meta = soup.find("meta", property="og:description")
         description = desc_meta["content"] if desc_meta else ""
-        
+
         # Description format usually: "Song · Artist · Year" or "Artist · Song · Single"
         artist = "Unknown Artist"
         if " · " in description:
@@ -173,7 +199,7 @@ class SpotifyParser:
         return SpotifyTrack(title=title, artist=artist, spotify_url=url)
 
     @classmethod
-    def _parse_collection(cls, url: str, collection_type: str) -> List[SpotifyTrack]:
+    def _parse_collection(cls, url: str, collection_type: str, session: Optional[requests.Session] = None) -> List[SpotifyTrack]:
         """
         Parses a Spotify Playlist or Album link by fetching the Embed page:
         https://open.spotify.com/embed/{playlist|album}/{id}
@@ -181,18 +207,20 @@ class SpotifyParser:
         The embed page embeds JSON state data inside a <script id="__NEXT_DATA__"> or
         <script id="initial-state"> tag, which contains the full track list.
         """
+        s = session or _make_session()
+
         # Extract Spotify ID from URL
         match = re.search(r"spotify\.com/(?:playlist|album)/([a-zA-Z0-9]+)", url)
         if not match:
             raise ValueError(f"Could not extract {collection_type} ID from URL: {url}")
-        
+
         item_id = match.group(1)
         embed_url = f"https://open.spotify.com/embed/{collection_type}/{item_id}"
 
-        response = requests.get(embed_url, headers=DEFAULT_HEADERS, timeout=10)
+        response = s.get(embed_url, timeout=10)
         response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(response.text, _HTML_PARSER)
         tracks: List[SpotifyTrack] = []
 
         # 1. Try parsing JSON script data embedded by Spotify Next.js app
@@ -202,7 +230,7 @@ class SpotifyParser:
                 json_data = json.loads(script_tag.string)
                 # Navigate nested JSON structure for playlist/album tracks
                 entity_data = json_data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {})
-                
+
                 # Check entity track list locations
                 track_list = []
                 if "playlist" in entity_data:
@@ -216,50 +244,63 @@ class SpotifyParser:
                     name = t_info.get("name")
                     artists = [a.get("name", "") for a in t_info.get("artists", [])]
                     artist_name = ", ".join(artists) if artists else "Unknown Artist"
-                    
+
                     if name:
                         tracks.append(SpotifyTrack(title=name, artist=artist_name, spotify_url=url))
-                
+
                 if tracks:
                     return tracks
             except (json.JSONDecodeError, KeyError):
                 pass
 
         # 2. Fallback: Parse track entries directly from HTML elements in the embed view
-        track_rows = soup.find_all("li", class_=re.compile(r"track", re.I)) or soup.find_all("div", class_=re.compile(r"track", re.I))
-        
+        track_rows = (
+            soup.find_all("li", class_=re.compile(r"track", re.I))
+            or soup.find_all("div", class_=re.compile(r"track", re.I))
+        )
+
         for row in track_rows:
             title_elem = row.find(class_=re.compile(r"title|name", re.I))
             artist_elem = row.find(class_=re.compile(r"artist", re.I))
-            
+
             if title_elem:
                 title = title_elem.get_text(strip=True)
                 artist = artist_elem.get_text(strip=True) if artist_elem else "Unknown Artist"
                 tracks.append(SpotifyTrack(title=title, artist=artist, spotify_url=url))
 
-        # 3. Secondary Fallback: Use oEmbed or open.spotify.com fallback if playlist has < 1 track
+        # 3. Secondary Fallback: fetch open.spotify.com main page HTML for meta tags, then
+        #    resolve individual track oEmbed requests in parallel for speed.
         if not tracks:
-            # Try fetching open.spotify.com main page HTML for meta tags
-            page_resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=10)
+            page_resp = s.get(url, timeout=10)
             if page_resp.ok:
-                page_soup = BeautifulSoup(page_resp.text, "html.parser")
-                title_meta = page_soup.find("meta", property="og:title")
-                collection_name = title_meta["content"] if title_meta else "Spotify Collection"
-                
-                # Search for track links inside open.spotify.com HTML
+                page_soup = BeautifulSoup(page_resp.text, _HTML_PARSER)
+
+                # Gather unique track IDs from anchor hrefs
                 track_links = page_soup.find_all("a", href=re.compile(r"/track/"))
-                seen_ids = set()
+                seen_ids: set = set()
+                track_urls: List[str] = []
                 for link in track_links:
                     href = link["href"]
-                    t_id = re.search(r"/track/([a-zA-Z0-9]+)", href)
-                    if t_id and t_id.group(1) not in seen_ids:
-                        seen_ids.add(t_id.group(1))
-                        # Fetch track info using oEmbed
-                        try:
-                            t_obj = cls._parse_track(f"https://open.spotify.com/track/{t_id.group(1)}")
-                            tracks.append(t_obj)
-                        except Exception:
-                            continue
+                    t_id_match = re.search(r"/track/([a-zA-Z0-9]+)", href)
+                    if t_id_match and t_id_match.group(1) not in seen_ids:
+                        seen_ids.add(t_id_match.group(1))
+                        track_urls.append(f"https://open.spotify.com/track/{t_id_match.group(1)}")
+
+                # Fetch oEmbed for all discovered tracks in parallel
+                if track_urls:
+                    ordered: List[Optional[SpotifyTrack]] = [None] * len(track_urls)
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        future_map = {
+                            executor.submit(cls._parse_track, t_url, s): i
+                            for i, t_url in enumerate(track_urls)
+                        }
+                        for future in as_completed(future_map):
+                            i = future_map[future]
+                            try:
+                                ordered[i] = future.result()
+                            except Exception:
+                                pass
+                    tracks = [t for t in ordered if t is not None]
 
         if not tracks:
             raise ValueError(f"Could not extract tracks from Spotify {collection_type}: {url}")
